@@ -1,21 +1,18 @@
 const { request, gql } = require('graphql-request');
 const sdk = require('@defillama/sdk');
-const axios = require('axios');
+const utils = require('../utils');
 const { getAddress } = require('ethers').utils;
 
 const SUBGRAPH_URL =
   'https://api.goldsky.com/api/public/project_cll6foogb576z38zr00ybh2hw/subgraphs/alto-lending-mainnet/0.0.4/gn';
 
 const CHAIN = 'ethereum';
+const PROJECT = 'alto';
 const SECONDS_PER_YEAR = 365 * 24 * 60 * 60;
-const WAD = 1e18;
 const ZERO_ADDRESS = '0x0000000000000000000000000000000000000000';
 
-const irmAbi =
+const IRM_ABI =
   'function updateInterestRateView(uint256 totalSupply, uint256 totalBorrowed) external view returns (uint256, uint256)';
-
-const balanceOfAbi =
-  'function balanceOf(address account) view returns (uint256)';
 
 const marketsQuery = gql`
   query GetMarkets($skip: Int!) {
@@ -32,7 +29,6 @@ const marketsQuery = gql`
       canBorrowFrom
       isMintMarket
       maximumLTV
-      liquidationThreshold
       irm
       totalSupply
       totalBorrow
@@ -40,190 +36,163 @@ const marketsQuery = gql`
         id
         symbol
         decimals
-        lastPriceUSD
       }
       borrowedToken {
         id
         symbol
         decimals
-        lastPriceUSD
       }
-      totalValueLockedUSD
-      totalDepositBalanceUSD
-      totalBorrowBalanceUSD
     }
   }
 `;
 
-const formatChain = (chain) =>
-  chain.charAt(0).toUpperCase() + chain.slice(1);
-
-const getPrices = async (addresses, chain) => {
-  const priceKeys = chain
-    ? addresses.map((address) => `${chain}:${address}`)
-    : addresses;
-  const prices = (
-    await axios.get(
-      `https://coins.llama.fi/prices/current/${priceKeys.join(',').toLowerCase()}`
-    )
-  ).data.coins;
-
-  return Object.entries(prices).reduce(
-    (acc, [address, price]) => ({
-      ...acc,
-      [address.split(':')[1].toLowerCase()]: price.price,
-    }),
-    {}
-  );
-};
-
-const aprToApy = (apr, compoundFrequency = 365) => {
-  if (!apr || !isFinite(apr)) return 0;
-  return (
-    (Math.pow(1 + (apr * 0.01) / compoundFrequency, compoundFrequency) - 1) *
-    100
-  );
+const fetchAllMarkets = async () => {
+  const markets = [];
+  let skip = 0;
+  while (true) {
+    const { markets: page } = await request(SUBGRAPH_URL, marketsQuery, {
+      skip,
+    });
+    if (!page?.length) break;
+    markets.push(...page);
+    if (page.length < 100) break;
+    skip += 100;
+  }
+  return markets;
 };
 
 const fetchLiveRates = async (markets) => {
   const rates = new Map();
-  const irmCalls = [];
-  const marketIndex = [];
+  const calls = [];
+  const callIndex = [];
 
-  for (let i = 0; i < markets.length; i++) {
-    const market = markets[i];
-    const marketId = market.id.toLowerCase();
-    const irmAddr = market.irm;
-    const totalSupplyBig = market.totalSupply || '0';
-    const totalBorrowBig = market.totalBorrow || '0';
+  for (const market of markets) {
+    const id = market.id.toLowerCase();
+    const { irm, totalSupply = '0', totalBorrow = '0' } = market;
 
-    if (!irmAddr || irmAddr === ZERO_ADDRESS || BigInt(totalBorrowBig) === 0n) {
-      rates.set(marketId, { borrowApr: 0, supplyApr: 0 });
+    if (!irm || irm === ZERO_ADDRESS || BigInt(totalBorrow) === 0n) {
+      rates.set(id, { borrowApr: 0, supplyApr: 0 });
       continue;
     }
 
-    irmCalls.push({ target: irmAddr, params: [totalSupplyBig, totalBorrowBig] });
-    marketIndex.push({ marketId, totalSupplyBig, totalBorrowBig });
+    calls.push({ target: irm, params: [totalSupply, totalBorrow] });
+    callIndex.push({ id, totalSupply, totalBorrow });
   }
 
-  if (irmCalls.length === 0) return rates;
+  if (!calls.length) return rates;
 
-  const result = await sdk.api.abi.multiCall({
-    calls: irmCalls,
-    abi: irmAbi,
+  const { output } = await sdk.api.abi.multiCall({
+    calls,
+    abi: IRM_ABI,
     chain: CHAIN,
     permitFailure: true,
   });
 
-  for (let j = 0; j < marketIndex.length; j++) {
-    const { marketId, totalSupplyBig, totalBorrowBig } = marketIndex[j];
-    const output = result.output[j];
-    if (!output?.output) continue;
+  for (let i = 0; i < callIndex.length; i++) {
+    const { id, totalSupply, totalBorrow } = callIndex[i];
+    const result = output[i]?.output;
+    if (!result) continue;
 
-    const [, borrowRatePerSecond] = output.output;
-    const borrowApr = (Number(borrowRatePerSecond) / WAD) * SECONDS_PER_YEAR * 100;
+    const [, borrowRatePerSecond] = result;
+    const borrowApr =
+      (Number(borrowRatePerSecond) / 1e18) * SECONDS_PER_YEAR * 100;
 
-    const totalSupplyNum = Number(totalSupplyBig);
-    const totalBorrowNum = Number(totalBorrowBig);
-    const utilization = totalSupplyNum > 0 ? totalBorrowNum / totalSupplyNum : 0;
+    const utilization =
+      Number(totalSupply) > 0
+        ? Number(totalBorrow) / Number(totalSupply)
+        : 0;
     const supplyApr = borrowApr * utilization;
 
-    rates.set(marketId, { borrowApr, supplyApr });
+    rates.set(id, { borrowApr, supplyApr });
   }
 
   return rates;
 };
 
 const apy = async () => {
-  let allMarkets = [];
-  let skip = 0;
-
-  while (true) {
-    const data = await request(SUBGRAPH_URL, marketsQuery, { skip });
-    const markets = data.markets || [];
-    if (!markets.length) break;
-    allMarkets = allMarkets.concat(markets);
-    skip += 100;
-  }
-
-  const liveRates = await fetchLiveRates(allMarkets);
+  const markets = await fetchAllMarkets();
+  if (!markets.length) return [];
 
   const tokenAddresses = [
     ...new Set(
-      allMarkets
+      markets
         .flatMap((m) => [m.inputToken?.id, m.borrowedToken?.id])
         .filter(Boolean)
         .map((a) => a.toLowerCase())
     ),
   ];
-  const prices = await getPrices(tokenAddresses, CHAIN);
 
-  const collateralBalances = await sdk.api.abi
-    .multiCall({
-      calls: allMarkets.map((m) => ({
-        target: m.inputToken.id,
-        params: [m.id],
-      })),
-      abi: balanceOfAbi,
-      chain: CHAIN,
-      permitFailure: true,
-    })
-    .then((r) => r.output.map((o) => o.output ?? '0'));
+  const [liveRates, collateralBalances, { pricesByAddress: prices }] =
+    await Promise.all([
+      fetchLiveRates(markets),
+      sdk.api.abi
+        .multiCall({
+          calls: markets.map((m) => ({
+            target: m.inputToken.id,
+            params: [m.id],
+          })),
+          abi: 'erc20:balanceOf',
+          chain: CHAIN,
+          permitFailure: true,
+        })
+        .then((r) => r.output.map((o) => o.output ?? '0')),
+      utils.getPrices(tokenAddresses, CHAIN),
+    ]);
 
-  const pools = allMarkets
-    .map((market, idx) => {
+  return markets
+    .map((market, i) => {
       if (!market.inputToken?.symbol) return null;
 
-      const marketId = market.id.toLowerCase();
-      const onChainRate = liveRates.get(marketId);
-
-      const supplyApr = onChainRate?.supplyApr ?? 0;
-      const borrowApr = onChainRate?.borrowApr ?? 0;
+      const id = market.id.toLowerCase();
+      const rates = liveRates.get(id) ?? { borrowApr: 0, supplyApr: 0 };
 
       const collateralAddr = market.inputToken.id.toLowerCase();
       const borrowAddr = market.borrowedToken?.id?.toLowerCase();
-      const collateralPrice = prices[collateralAddr] || 0;
+      const collateralPrice = prices[collateralAddr] ?? 0;
+      const borrowPrice = prices[borrowAddr] ?? 0;
+
+      if (!collateralPrice) return null;
+
       const collateralDecimals = Number(market.inputToken.decimals);
-      const borrowPrice = prices[borrowAddr] || 0;
       const borrowDecimals = Number(market.borrowedToken?.decimals ?? 18);
 
-      const tvlUsd =
-        (Number(collateralBalances[idx] ?? 0) * collateralPrice) /
-        Math.pow(10, collateralDecimals);
+      const totalSupplyUsd =
+        (Number(collateralBalances[i]) / 10 ** collateralDecimals) *
+        collateralPrice;
 
       const totalBorrowUsd =
-        (Number(market.totalBorrow ?? 0) * borrowPrice) /
-        Math.pow(10, borrowDecimals);
+        (Number(market.totalBorrow ?? 0) / 10 ** borrowDecimals) * borrowPrice;
 
-      const debtCeilingUsd = Math.max(0, tvlUsd - totalBorrowUsd);
+      const tvlUsd = Math.max(0, totalSupplyUsd - totalBorrowUsd);
 
       let ltv = Number(market.maximumLTV);
       if (ltv > 1) ltv = ltv / 1e18;
 
-      const symbol = market.inputToken.symbol;
-      const borrowedSymbol = market.borrowedToken?.symbol;
       const isMintMarket = market.isMintMarket === true;
+      const borrowedSymbol = market.borrowedToken?.symbol;
+      const marketAddr = getAddress(market.id);
 
       return {
-        pool: `alto-${marketId}-${CHAIN}`,
-        chain: formatChain(CHAIN),
-        project: 'alto',
-        symbol,
-        apyBase: aprToApy(supplyApr),
-        apyBaseBorrow: aprToApy(borrowApr),
+        pool: `${id}-${CHAIN}`,
+        chain: utils.formatChain(CHAIN),
+        project: PROJECT,
+        symbol: utils.formatSymbol(market.inputToken.symbol),
         tvlUsd,
-        totalSupplyUsd: tvlUsd,
+        totalSupplyUsd,
         totalBorrowUsd,
-        debtCeilingUsd,
+        apyBase: utils.aprToApy(rates.supplyApr),
+        apyBaseBorrow: utils.aprToApy(rates.borrowApr),
         underlyingTokens: [collateralAddr],
         ltv,
-        ...(isMintMarket && borrowedSymbol && { mintedCoin: borrowedSymbol }),
-        url: `https://app.alto.money/${isMintMarket ? 'mint' : 'borrow'}/1:${getAddress(market.id)}`,
+        borrowable: market.canBorrowFrom === true,
+        ...(isMintMarket && borrowedSymbol
+          ? { mintedCoin: borrowedSymbol }
+          : {}),
+        url: `https://app.alto.money/${isMintMarket ? 'mint' : 'borrow'}/1:${marketAddr}`,
       };
     })
-    .filter(Boolean);
-
-  return pools;
+    .filter(Boolean)
+    .filter(utils.keepFinite);
 };
 
 module.exports = {
